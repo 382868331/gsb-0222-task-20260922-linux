@@ -1,4 +1,4 @@
-"""固定输入演示：可选停止下的均值证据过程。
+"""固定输入演示：可选停止下的均值证据过程 + 有限网格双侧置信集。
 
 运行：python demo.py（约 1 秒内，纯标准库、离线、确定性数据）。
 
@@ -9,13 +9,15 @@
 3. 实际触发的异常边界：lambda > 1/m 被拒绝（ValueError），
    以及批量追加中混入越界观测时整批不留部分变更。
 4. 状态序列化/恢复后继续推进与未中断完全一致。
+5. 有限均值网格双侧置信集（alpha 固定平分）：正常收缩到真值附近、
+   全 0 序列导致的空置信集与财富归零边界、实际触发的非法输入异常。
 """
 
 from __future__ import annotations
 
 import time
 
-from mean_evidence import MeanEvidenceProcess
+from mean_evidence import MeanEvidenceProcess, MeanGridConfidenceSet
 
 M = 0.5
 GRID = [0.0, 0.5, 1.0, 2.0]  # 2.0 = 1/m 为允许的最大 lambda
@@ -114,6 +116,78 @@ def main() -> None:
     same_wealth = resumed.log_wealth() == full.log_wealth()
     same_snapshot = resumed.snapshot() == full.snapshot()
     print(f"  分段恢复并继续 30 步后，财富轨道一致：{same_wealth}；快照一致：{same_snapshot}")
+
+    # --- 场景 E：有限均值网格上的双侧置信集 -------------------------------
+    banner("场景 E（有限均值网格双侧置信集，alpha=0.1 固定平分为每侧 0.05）")
+    candidates = [0.2, 0.35, 0.5, 0.65, 0.8]
+    lam_max = min(min(1.0 / c, 1.0 / (1.0 - c)) for c in candidates)
+    grid2 = [0.0, 0.5, 1.0, lam_max]  # 1.25 = min_j min(1/m_j, 1/(1-m_j))
+    print(f"候选网格 {candidates}，共享 lambda 网格 {grid2}")
+    print("每个候选维护上尾（H0: μ<=m_j）与下尾（H0: μ>=m_j）两条财富，")
+    print("任一侧混合财富 >= 2/alpha=20 即拒绝该候选；下注为固定常数 λ，")
+    print("不依赖任何观测，自动满足“下注仅依赖过去”。")
+
+    stream_mid = lcg(300, seed=777, lo=0.45, hi=0.85)  # 均值约 0.65
+    cs = MeanGridConfidenceSet(candidates, grid2, 0.1)
+    print(f"样本均值（300点）= {sum(stream_mid) / len(stream_mid):.4f}")
+    prev = None
+    for x in stream_mid:
+        snap = cs.update(x)
+        cur = snap.confidence_set
+        if cur != prev:
+            print(f"  t={snap.t:3d}  置信集收缩 -> "
+                  f"{[round(c, 2) for c in cur]}"
+                  + ("" if cur else "（空：网格内已无未拒绝候选）"))
+            prev = cur
+        if not cur:
+            break
+    snap = cs.snapshot()
+    print(f"=> 最终置信集 {[round(c, 2) for c in snap.confidence_set]}，"
+          f"被拒绝 {[round(c, 2) for c in snap.rejected]}")
+    print(f"   各候选拒绝时刻 {list(snap.rejection_times)}")
+
+    print("E2 边界：全 0 序列（真实均值 0 不在网格内）")
+    cs_zero = MeanGridConfidenceSet([0.5], [2.0], 0.1)
+    for _ in range(5):
+        snap_z = cs_zero.update(0)
+    print(f"  x=0 使上尾因子 1+2(0-1/2)=0：上尾财富归零且永久不可复活，"
+          f"upper_log_evidence={snap_z.upper_log_evidence[0]}")
+    print(f"  下尾每步乘 2，t={snap_z.t} 时越过 20，置信集为空 "
+          f"{snap_z.confidence_set}——空集表示真值不在给定网格内（网格限制）")
+
+    print("E3 实际触发的异常边界：")
+    print("E3a 重复候选均值：")
+    try:
+        MeanGridConfidenceSet([0.5, 0.5], [1.0], 0.1)
+    except ValueError as exc:
+        print(f"  捕获 {type(exc).__name__}: {exc}")
+    print("E3b lambda 超过双侧共享上界（候选 0.2 的下尾只允许 λ<=1.25）：")
+    try:
+        MeanGridConfidenceSet([0.2], [1.5], 0.1)
+    except ValueError as exc:
+        print(f"  捕获 {type(exc).__name__}: {exc}")
+    print("E3c 批量追加混入越界观测（原子性，不留部分变更）：")
+    cs_c = MeanGridConfidenceSet(candidates, grid2, 0.1)
+    cs_c.extend([0.6, 0.7])
+    state_before = cs_c.to_dict()
+    try:
+        cs_c.extend([0.9, 1.5, 0.6])
+    except ValueError as exc:
+        print(f"  捕获 {type(exc).__name__}: {exc}")
+    print(f"  失败后 t 仍为 {cs_c.t}（=2），状态与失败前完全一致："
+          f"{cs_c.to_dict() == state_before}")
+
+    print("E4 置信集状态序列化/恢复后继续，与未中断一致：")
+    full_g = MeanGridConfidenceSet(candidates, grid2, 0.1)
+    full_g.extend(stream_mid[:60])
+    part_g = MeanGridConfidenceSet(candidates, grid2, 0.1)
+    part_g.extend(stream_mid[:25])
+    resumed_g = MeanGridConfidenceSet.from_json(
+        part_g.to_json(), candidates=candidates, lambdas=grid2, alpha=0.1
+    )
+    resumed_g.extend(stream_mid[25:60])
+    print(f"  分段恢复并继续 35 步后，快照一致："
+          f"{resumed_g.snapshot() == full_g.snapshot()}")
 
     print("\n" + "=" * 72)
     print(f"演示完成，实际耗时 {time.perf_counter() - t0:.3f} 秒（无 sleep、无网络）。")
