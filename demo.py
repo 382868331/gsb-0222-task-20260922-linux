@@ -9,13 +9,15 @@
 3. 实际触发的异常边界：lambda > 1/m 被拒绝（ValueError），
    以及批量追加中混入越界观测时整批不留部分变更。
 4. 状态序列化/恢复后继续推进与未中断完全一致。
+5. 双侧候选均值网格（TwoSidedMeanEvidence）：上下尾财富、固定平分 alpha/2、
+   尚未拒绝的候选集合随流收缩；含退化下注、全 0/全 1、网格 λ 上界报错。
 """
 
 from __future__ import annotations
 
 import time
 
-from mean_evidence import MeanEvidenceProcess
+from mean_evidence import MeanEvidenceProcess, TwoSidedMeanEvidence
 
 M = 0.5
 GRID = [0.0, 0.5, 1.0, 2.0]  # 2.0 = 1/m 为允许的最大 lambda
@@ -114,6 +116,81 @@ def main() -> None:
     same_wealth = resumed.log_wealth() == full.log_wealth()
     same_snapshot = resumed.snapshot() == full.snapshot()
     print(f"  分段恢复并继续 30 步后，财富轨道一致：{same_wealth}；快照一致：{same_snapshot}")
+
+    # --- 场景 E：双侧候选网格 ---------------------------------------------
+    banner("场景 E（双侧候选均值网格 TwoSidedMeanEvidence）")
+    print("候选 mus=[0.2,0.4,0.6,0.8]，共用网格 lambdas=[0,1.25]，alpha=0.1")
+    print("（公共 λ 上界 = min_i min(1/mu_i,1/(1-mu_i)) = 1/0.8 = 1.25；"
+          "每侧 alpha/2=0.05，阈值 2/alpha=20）")
+    two = TwoSidedMeanEvidence([0.2, 0.4, 0.6, 0.8], [0.0, 1.25], 0.1)
+    print(f"初始（t=0）：尚未拒绝候选 = {two.snapshot().surviving}")
+    # 前 8 个 0.95（≈强势上尾证据）；随后 12 个 0.05（下尾证据累积但不回溯）
+    for x in [0.95] * 8:
+        s = two.update(x)
+    print("8 个 0.95 后，各候选状态：")
+    for c in s.candidates:
+        tag = f"拒绝(上尾 t={c.reject_time})" if c.rejected else "存活"
+        print(f"  mu={c.mu:.1f}  E+={c.upper_evidence:9.4g}  "
+              f"E-={c.lower_evidence:9.4g}  p_双侧={c.p_value_two_sided:.4g}  {tag}")
+    print(f"=> 尚未拒绝的候选集合：{s.surviving}（网格点之外的均值无法评估）")
+    for x in [0.05] * 12:
+        s = two.update(0.05)
+    print("再接 12 个 0.05 后：")
+    for c in s.candidates:
+        side_zh = "上" if c.reject_side == "upper" else "下"
+        tag = (f"首次拒绝 t={c.reject_time} {side_zh}尾"
+               if c.rejected else "存活")
+        print(f"  mu={c.mu:.1f}  E+={c.upper_evidence:9.4g}  "
+              f"E-={c.lower_evidence:9.4g}  p_双侧={c.p_value_two_sided:.4g}  {tag}")
+    print(f"=> 最终尚未拒绝：{s.surviving}；首次拒绝时刻不被后续下尾证据改写。")
+
+    # --- 场景 F：双侧的退化下注 / 全0全1 / 实际错误 ------------------------
+    banner("场景 F（双侧边界：退化网格、财富归零、实际错误）")
+
+    print("F1 退化下注（仅有 λ=0）：无论看多少 0/1，证据恒为 1，候选永不被拒：")
+    deg = TwoSidedMeanEvidence([0.2, 0.5, 0.8], [0.0], 0.1)
+    sd = deg.extend([1] * 20 + [0] * 20)
+    print(f"  40 个 0/1 后 surviving={sd.surviving}，"
+          f"任取候选 E+={sd.candidates[0].upper_evidence:g}，"
+          f"p_双侧={sd.candidates[0].p_value_two_sided:g}")
+
+    print("F2 全 1 流：下尾非零轨道首步因子 1-λ(1-μ)=0 归零且不复活；")
+    print("   上尾增长并拒绝低候选（mu=.5, lambdas={0,2}, 每侧阈值 4，t=3）：")
+    ones = TwoSidedMeanEvidence([0.5], [0.0, 2.0], 0.5)
+    for x in [1, 1, 1]:
+        so = ones.update(x)
+    co = so.candidates[0]
+    up_lw, lo_lw = ones.candidate_log_wealth(0)
+    side_zh = "上" if co.reject_side == "upper" else "下"
+    print(f"  E+={co.upper_evidence:g}（拒绝，{side_zh}尾 t={co.reject_time}），"
+          f"E-={co.lower_evidence:g}；上尾 log 财富={up_lw}，下尾={lo_lw}")
+
+    print("F3 全 0 流的镜像：下尾在 t=3 拒绝：")
+    zeros = TwoSidedMeanEvidence([0.5], [0.0, 2.0], 0.5)
+    cz = zeros.extend([0, 0, 0]).candidates[0]
+    print(f"  E-={cz.lower_evidence:g}，下尾拒绝 t={cz.reject_time}")
+
+    print("F4 λ 超过公共上界（候选含 0.1 时 cap=min(1/0.1,1/0.9)≈1.111，给 2.0）：")
+    try:
+        TwoSidedMeanEvidence([0.1, 0.5, 0.9], [2.0], 0.1)
+    except ValueError as exc:
+        print(f"  捕获 {type(exc).__name__}: {exc}")
+
+    print("F5 候选均值碰到 0/1 边界（必须严格位于 (0,1)）：")
+    try:
+        TwoSidedMeanEvidence([0.5, 1.0], [1.0], 0.1)
+    except ValueError as exc:
+        print(f"  捕获 {type(exc).__name__}: {exc}")
+
+    print("F6 批量混入非法观测（x=1.5）：整批拒绝，全部候选状态不变：")
+    atom = TwoSidedMeanEvidence([0.3, 0.7], [0.0, 1.4], 0.1)
+    atom.extend([0.8, 0.2])
+    before = atom.to_dict()
+    try:
+        atom.extend([0.9, 1.5, 0.1])
+    except ValueError as exc:
+        print(f"  捕获 {type(exc).__name__}: {exc}")
+    print(f"  失败后 t={atom.t}（=2），状态与失败前完全一致：{atom.to_dict() == before}")
 
     print("\n" + "=" * 72)
     print(f"演示完成，实际耗时 {time.perf_counter() - t0:.3f} 秒（无 sleep、无网络）。")

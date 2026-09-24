@@ -9,6 +9,9 @@
 - 在 H0 下每个因子条件期望 ≤ 1，`W_λ` 与 `E_t` 均为非负上鞅；
   由 Ville 不等式 `P_H0(∃t: E_t ≥ 1/α) ≤ α`，故可在**任意可选停止时刻**下结论。
 - 任意时刻 p 值 `p_t = min(1, 1 / max_{s≤t} E_s)`。
+- **双侧候选网格版本 `TwoSidedMeanEvidence`**：对调用者给定的有限候选均值网格
+  `{μ_i}` 同时维护**上尾/下尾**财富（见下文专节），双侧 α 固定平分，
+  返回尚未被任一侧拒绝的候选集合。
 
 ## 运行环境与命令
 
@@ -16,10 +19,10 @@
 - **无需安装任何第三方依赖**，不需要网络、账号、密钥、数据库或 Docker。
 
 ```bash
-# 必要测试（独立 Fraction 参考 + 契约边界测试，共 42 个）
+# 必要测试（独立 Fraction 参考 + 契约边界 + 双侧候选网格，共 68 个）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（确定性数据，真实计算，实测约 0.04 秒，远小于 8 秒）
+# 固定输入演示（确定性数据，真实计算，实测约 0.01 秒，远小于 90 秒）
 python demo.py
 ```
 
@@ -57,6 +60,70 @@ proc2 = MeanEvidenceProcess.from_json(
 
 越界只记录 `stop_time`，**不禁止继续追加**；`stop_time` 永远是首次时刻。
 
+## 双侧候选均值网格：`TwoSidedMeanEvidence`
+
+在单侧过程之上提供题面要求的双侧候选网格能力。对调用者给定的**有限候选均值
+网格** `mus=[μ_1,…,μ_M]`（每项严格 `0 < μ < 1`）与**上下尾共用的固定 λ 网格**
+`lambdas`，每个候选维护两套财富：
+
+- 上尾（检验 H0⁺：`E[x_t|F_{t-1}] ≤ μ_i`）：
+  `W⁺_λ(t) = ∏ (1 + λ(x_s − μ_i))`；
+- 下尾（检验 H0⁻：`E[x_t|F_{t-1}] ≥ μ_i`）：
+  `W⁻_λ(t) = ∏ (1 − λ(x_s − μ_i))`。
+
+**下注仅依赖过去**：第 t 步乘数只含 `x_t` 与既有财富，不用未来信息；
+观测允许自适应、可非同分布。
+
+**双侧 α 固定平分**：构造时给定总 α，每侧水平恒为 α/2、Ville 阈值恒为
+`2/α`（不做自适应再分配）。上下尾在 H0⁺/H0⁻ 下各为非负上鞅，
+联合界（Bonferroni）给出双侧第一类错误 ≤ α；
+双侧 p 值 `p = min(1, 2·min(p⁺, p⁻))`，恰在候选被任一侧拒绝时 `p ≤ α`。
+
+**λ 的公共上界**：因子非负要求上尾 `λ ≤ 1/μ_i`、下尾 `λ ≤ 1/(1−μ_i)`，
+故网格每项必须满足
+`0 ≤ λ ≤ min_i min(1/μ_i, 1/(1−μ_i))`，越界在构造时拒绝。
+
+```python
+from mean_evidence import TwoSidedMeanEvidence
+
+proc = TwoSidedMeanEvidence(mus=[0.2, 0.4, 0.6, 0.8],
+                            lambdas=[0.0, 1.25], alpha=0.1)
+snap = proc.update(0.95)        # 单点；extend(xs) 批量（整批原子）
+snap = proc.snapshot()
+snap.surviving                  # (0.6, 0.8) —— 尚未被任一侧拒绝的候选 μ
+snap.rejected                   # (0.2, 0.4) —— 已拒绝（保持构造顺序）
+c = snap.candidates[0]          # 每个候选的 CandidateEvidence
+c.upper_evidence / c.lower_evidence          # 当步 E⁺_t / E⁻_t
+c.max_upper_log_evidence / max_lower_log_…   # 各侧历史峰值 log
+c.upper_p_value / c.lower_p_value            # 每侧原始 p（min(1,1/max E±)）
+c.p_value_two_sided                          # min(1, 2·min(p⁺,p⁻))
+c.rejected / c.reject_time / c.reject_side   # "upper"/"lower"；同时刻记上尾
+
+proc.candidate_log_wealth(i)    # (上尾各 λ log 财富, 下尾各 λ log 财富)
+proc.alpha_per_side             # α/2；proc.threshold == 2/α
+text = proc.to_json()           # 另有 to_dict()；from_json/from_dict 恢复
+proc2 = TwoSidedMeanEvidence.from_json(text)
+```
+
+其他属性：`proc.mus`、`proc.lambdas`（tuple 副本）、`proc.alpha`、`proc.t`、
+`TwoSidedMeanEvidence.start(...)`（构造器别名）。拒绝只记录首次时刻与侧别，
+**不禁止继续追加**；后续另一侧越界不会改写该候选的首次拒绝信息。
+
+**网格限制（重要）**：结论只对 `mus` 中列出的候选点成立——
+模块对网格之外的任何均值不作判断，也不做候选间插值、连续边界求根或
+置信区间；候选不被拒绝 ≠ 该 μ 被“接受”，只表示当前证据尚未越过阈值。
+λ 网格影响功效但不影响 α 控制；网格在构造时固定，不随数据调整。
+本次迭代**不**提供迟到/乱序数据、连续边界求根、自适应策略学习。
+
+### 双侧状态序列化
+
+状态 `kind="two_sided_mean_evidence"`、`version=1`：
+`{kind, version, mus, lambdas, alpha, t, upper:[…], lower:[…]}`，
+其中上下尾各为 M 个单侧 `version=1` 子状态（下尾以 `m=1−μ`、
+观测 `1−x` 的镜像形式存储）。恢复时完整校验种类/版本、长度、
+子过程 `m=μ`/`1−μ`、子过程 `alpha` 恰为 `alpha/2`、各子过程 `t` 一致等；
+单侧状态不能从双侧入口恢复。不提供配置变更或跨版本迁移路径。
+
 ## 输入上限与错误语义
 
 **接口边界（构造参数）**
@@ -68,6 +135,14 @@ proc2 = MeanEvidenceProcess.from_json(
   演示与测试只使用小规模。
 - `alpha`：严格 `0 < alpha < 1` 的有限实数。
 - 观测 `x_t`：有限且 `0 ≤ x_t ≤ 1`，`int` 或 `float`（接受 `0`、`1` 整数边界）。
+
+**`TwoSidedMeanEvidence` 的附加边界**
+
+- `mus`：非空有限序列（非字符串），每项严格 `0 < μ_i < 1`；重复值按重复计数。
+- `lambdas`：每项须满足 `0 ≤ λ ≤ min_i min(1/μ_i, 1/(1−μ_i))`
+  （上下尾因子非负的公共上界，错误信息给出具体上界值）。
+- 观测校验、`extend` 原子性、NaN/Infinity/bool 拒绝规则与单侧完全一致；
+  双侧内部仅以 `1−x` 喂镜像下尾过程，不引入新的数值入口。
 
 **错误类型约定**
 
@@ -126,6 +201,10 @@ proc2 = MeanEvidenceProcess.from_json(
    Ville 界约束的是首次越界概率。
 5. **状态只存 log 财富与峰值**：恢复后从财富重算当前 `log E` 并交叉校验峰值，
    不盲信序列化的派生量。
+6. **双侧复用单侧（组合而非复制算法）**：每个候选的下尾过程就是
+   `m=1−μ`、观测 `1−x` 的单侧过程（`1+λ((1−x)−(1−μ)) ≡ 1−λ(x−μ)`），
+   因此上下尾共用同一套经过验证的 log 域/fma/归零逻辑；α 固定平分，
+   不做任何数据驱动的权重调整（那会破坏上鞅与 α 保证）。
 
 ## 已知限制 / 范围声明
 
@@ -134,17 +213,27 @@ proc2 = MeanEvidenceProcess.from_json(
   分布形态、方差、分位数或相关性作任何额外断言，λ 网格选择影响功效但不影响第一类错误控制。
 - 要求 `x_t ∈ [0,1]` 与 `0 ≤ λ ≤ 1/m`，这是因子非负（Ville 适用）的前提；
   无界观测或其他参数化（如 e-process 的其他混合测度）不在本题契约内。
+- 双侧候选网格（`TwoSidedMeanEvidence`）额外限定：结论只覆盖 `mus` 中列出的
+  有限候选点，**不做**网格外推断、候选间插值、连续 μ 上的边界求根或置信集；
+  “未拒绝”不等于接受。本次迭代也**不**处理迟到/乱序数据与自适应策略学习；
+  双侧 α 只支持固定平分（每侧 α/2）。
 - 不实现流式网格扩展、连续 λ 积分、多重检验校正，也不宣称兼容任何行业标准协议；
   这只是本题规定的有限数学子集。
 - 线程安全：对象无内置锁；多线程使用请自行同步。
-- 状态 JSON 为人工可读格式，但仅支持 `version=1`，跨版本迁移未实现。
+- 状态 JSON 为人工可读格式，但仅支持 `version=1`（双侧另有 `kind` 标识），
+  跨版本迁移未实现。
 
 ## 文件
 
-- `mean_evidence.py` — 核心模块（无第三方依赖）。
-- `tests/test_independent_reference.py` — 独立 Fraction 参考：两点 Bernoulli 全路径枚举
+- `mean_evidence.py` — 核心模块（无第三方依赖）：单侧 `MeanEvidenceProcess`
+  与双侧候选网格 `TwoSidedMeanEvidence`、快照 dataclass。
+- `tests/test_independent_reference.py` — 单侧独立 Fraction 参考：两点 Bernoulli 全路径枚举
   验证 H0 下 `E[W_λ] ≤ 1`、Ville 命中质量 ≤ α，以及与核心的逐点对照。
+- `tests/test_two_sided.py` — 双侧独立 Fraction 参考（期望值不来自被测核心）：
+  手算全 1/全 0、退化 λ=0、财富双侧归零、候选集合收缩、Bernoulli 命中质量
+  （含 α 界紧的情形）、构造/观测校验与批量原子性、序列化损坏状态拒绝。
 - `tests/test_contract.py` — 0/1 边界、零因子、非法 λ、NaN/bool 拒绝、
   批量原子性、状态恢复/损坏/配置锁定、长流不溢出等契约测试。
-- `demo.py` — 固定确定性输入：正常停止、正常不拒绝、三类实际触发的异常边界、
-  序列化恢复一致性。
+- `demo.py` — 固定确定性输入：单侧正常停止/不拒绝、三类实际异常边界、
+  序列化恢复一致性，以及双侧候选网格的正常收缩、退化下注、全 0/全 1、
+  λ 上界与候选边界、批量错误的原子性（场景 E–F）。
