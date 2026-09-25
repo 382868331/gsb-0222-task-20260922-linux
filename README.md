@@ -148,3 +148,103 @@ proc2 = MeanEvidenceProcess.from_json(
   批量原子性、状态恢复/损坏/配置锁定、长流不溢出等契约测试。
 - `demo.py` — 固定确定性输入：正常停止、正常不拒绝、三类实际触发的异常边界、
   序列化恢复一致性。
+
+## 可预测自适应下注：`predictable_betting` 入口
+
+固定 λ 网格之外，本模块还提供 λ **只依赖过去历史**的自适应下注入口
+`PredictableBettingProcess`（策略实现为仓库内的**有限状态表**，
+不执行用户回调、不执行字符串代码、无外部 I/O）：
+
+```python
+from mean_evidence import FiniteBettingStrategy, PredictableBettingProcess
+
+# 二状态策略：上一轮 x < m 时本轮封存 lambda=0；x >= m 时封存 lambda=1/m。
+strat = FiniteBettingStrategy(
+    states=["low", "high"],
+    initial_state="low",
+    bet_lambdas={"low": 0.0, "high": 2.0},          # 每状态一个封存值
+    edges={                                           # 上一轮反馈 -> 下一状态
+        "low":  {0: "low", 1: "high"},
+        "high": {0: "low", 1: "high"},
+    },
+    cutpoints=[0.0, 0.5, 1.0],   # 档位0=[0,.5)，档位1=[.5,1]
+)
+proc = PredictableBettingProcess(m=0.5, strategy=strat, alpha=0.05)
+
+bet  = proc.prepare()   # 每轮第 1 步：只用历史（当前状态）封存 lambda
+snap = proc.observe(x)  # 每轮第 2 步：然后才接收这一轮的 x
+```
+
+### 轮次协议（先下注、后观察，不可颠倒）
+
+- `prepare()` 用已有历史查表生成并封存本轮 lambda，返回不可变
+  `SealedBet(round_index, state, lam)`；**重复 prepare 幂等**，返回同一份
+  封存，同一轮没有任何更换 lambda 的入口。
+- `observe(x)` 必须在 prepare 之后；**未 prepare 直接 observe 抛 `RuntimeError`**；
+  observe 成功后封存解除，下一轮必须重新 prepare。封存之后、observe 之前
+  重复 observe 不可能发生（第二次会因“未封存”被拒绝）。
+- 非法 x（越界/NaN/bool 等）不推进过程，封存保留，可换合法 x 再 observe。
+- 便利方法 `run_round(x)` 等价于先 `prepare()` 再 `observe(x)`；`extend(xs)`
+  逐轮执行两阶段协议，整批先校验后推进（原子），且在有未完成封存时拒绝。
+
+### 反馈分箱（显式半开区间）
+
+`cutpoints` 必须为 `0 = c0 < c1 < ... < c_n = 1`；档位 k 的区间为
+`[c_k, c_{k+1})`，**最后一档包含右端点 1**（即 `[c_{n-1}, 1]`）。
+这些区间覆盖整个 [0,1] 且互不重叠；观察 x 后只按它落入的档位选下一状态。
+切点本身左闭（如 `x=0.5` 归入以 0.5 为起点的档位），`x=1` 归入最后一档。
+
+### 策略表结构与校验
+
+- `states`：非空、互不重复的 str 状态名；`initial_state` 必须在其中。
+- `bet_lambdas`：`{状态: lambda}`，每个状态恰好一个封存值；构造过程时
+  静态校验所有值满足 `0 <= lambda <= 1/m`（超限直接 `ValueError`，
+  不存在运行到某轮才发现 λ 非法的情况）。负数/NaN/Infinity/bool 一律拒绝。
+- `edges`：`{状态: {档位: 下一状态}}`，每个状态必须为**每个**档位给出下一
+  状态，目标状态必须存在；缺行、缺档位、键非 int、未知目标均抛错。
+  下一轮的 lambda 由下一状态唯一决定，因此“状态与上一轮离散反馈选择
+  下一状态和 lambda”。
+- 单状态、`edges` 全部指向自身即**固定 lambda 退化**，此时财富与固定
+  网格单轨道逐位一致（测试直接对照 `MeanEvidenceProcess`）。
+
+### 财富、p 值与有效性范围
+
+财富为单轨道 `W_t = prod_{s<=t}(1 + lambda_s (x_s - m))`，其中 `lambda_s`
+在看到 `x_s` 之前封存。因为封存值恒在 `[0, 1/m]`，因子非负；在 H0
+`E[x_t | F_{t-1}] <= m` 下
+`E[1 + lambda_t(x_t-m) | F_{t-1}] <= 1`，W 仍是（适应式）非负上鞅，
+Ville 界与 anytime p `min(1, 1/max_{s<=t} W_s)` 照旧成立。**保证明确依赖
+条件均值假设，不允许、接口也无法实现“回看当前 x 挑收益最大的 lambda”**；
+模块不据此对独立性之外的假设作任何额外宣称。
+
+计算口径与固定网格一致：log 域累加（`math.fma` 单次舍入的因子），
+`factor <= 0` 判财富归零且**永久保持零**（归零后状态机仍照常转移），
+历史最大值/停止时刻/阈值判定规则不变，`EvidenceSnapshot` 复用同一类型。
+
+### 序列化：策略指纹与封存轮次
+
+`to_dict()/to_json()` 导出的状态（`version=1, kind="predictable_betting"`）包含：
+
+- `strategy`：完整策略表；`fingerprint`：其规范化 JSON 的 SHA3-256 摘要；
+- `state`：当前状态；`t`、`log_wealth`（归零为 `null`）、`max_log_wealth`、
+  `stop_time`；
+- `sealed`：**当前封存轮次**（`round_index=t+1`、封存状态与封存 lambda），
+  未封存时为 `null`。
+
+`from_dict/from_json` 从状态重建策略并**重算指纹核对**：任何对策略的修改
+（含只改一个 lambda）都会使指纹不一致而拒绝恢复；可选 `strategy=`/`m=`/
+`alpha=` 断言同样逐位锁定。封存信息也被交叉校验（轮次、状态、封存值
+必须与策略表和当前状态一致）。测试覆盖：恢复后未重新 prepare 的重复
+observe 被拒、修改策略被拒、`x=1` 分箱边界、以及极小财富（连续 1200 个
+`x=0` 使 `evidence` 下溢为 0 而 `log_evidence` 仍有限）。
+
+### 新增测试文件
+
+- `tests/test_predictable_contract.py` — 策略表校验、半开区间分箱（含
+  `x=1`/切点左闭）、封存协议（幂等 prepare、未封存拒绝、重复观察拒绝、
+  非法 x 不破坏封存）、λ 上界、归零永久保持、极小财富、指纹锁定/篡改
+  拒绝/封存中恢复等（28 个）。
+- `tests/test_predictable_reference.py` — 独立 `Fraction` 参考：手算二状态
+  策略逐事件核对“封存先于观察”、固定退化与单轨道对照、9/8 小序列精确
+  乘积，以及自适应状态机的 2^n Bernoulli 路径精确枚举（H0 下 Ville
+  命中质量 ≤ α）（8 个）。

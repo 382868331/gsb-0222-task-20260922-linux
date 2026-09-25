@@ -15,7 +15,11 @@ from __future__ import annotations
 
 import time
 
-from mean_evidence import MeanEvidenceProcess
+from mean_evidence import (
+    FiniteBettingStrategy,
+    MeanEvidenceProcess,
+    PredictableBettingProcess,
+)
 
 M = 0.5
 GRID = [0.0, 0.5, 1.0, 2.0]  # 2.0 = 1/m 为允许的最大 lambda
@@ -114,6 +118,59 @@ def main() -> None:
     same_wealth = resumed.log_wealth() == full.log_wealth()
     same_snapshot = resumed.snapshot() == full.snapshot()
     print(f"  分段恢复并继续 30 步后，财富轨道一致：{same_wealth}；快照一致：{same_snapshot}")
+
+    # --- 场景 E：predictable_betting（封存式自适应下注） ------------------
+    banner("场景 E（predictable_betting）：每轮先封存 lambda，再观察 x")
+    # 二状态有限状态表：上一轮 x < 0.5 时下注 lambda=0（观望），
+    # x >= 0.5 时下注 lambda*=1/m=2。反馈按半开区间 [0,.5)、[.5,1] 分箱。
+    strat = FiniteBettingStrategy(
+        states=["low", "high"],
+        initial_state="low",
+        bet_lambdas={"low": 0.0, "high": 2.0},
+        edges={
+            "low": {0: "low", 1: "high"},
+            "high": {0: "low", 1: "high"},
+        },
+        cutpoints=[0.0, 0.5, 1.0],
+    )
+    print(f"策略指纹（SHA3-256）：{strat.fingerprint()[:16]}...")
+    pe = PredictableBettingProcess(M, strat, ALPHA)
+    # 确定性序列：先出现一次高反馈进入 high，随后连续高值触发越界；
+    # 中间夹一个低值演示归零后状态仍照常转移。
+    stream_adapt = [0.1, 0.9] + [1.0] * 6
+    stop_e = None
+    for i, x in enumerate(stream_adapt, start=1):
+        bet = pe.prepare()  # 先封存：重复 prepare 幂等，同一轮不换 lambda
+        snap = pe.observe(x)
+        if i <= 4 or snap.stopped:
+            print(f"  t={snap.t:3d}  封存状态={bet.state:4s} lambda_t={bet.lam:g}  "
+                  f"x_t={x:.4f}  W_t={snap.evidence:9.4g}  p_t={snap.p_value:.4g}")
+        if snap.stopped and stop_e is None:
+            stop_e = snap
+            break
+    if stop_e is not None:
+        print(f"=> 首次越界时刻 t={stop_e.stop_time}，anytime p={stop_e.p_value:.4g}")
+    else:
+        print("=> 序列内未越界（结论仍由 Ville 界保护）。")
+    print("   lambda_t 只由 t 之前的状态（历史反馈）决定，封存后才看到 x_t；")
+    print("   不允许回看当前 x 挑收益最大的 lambda，故上鞅/Ville 保证仍然成立。")
+
+    print("E1 未 prepare 直接 observe 被拒绝（不能看见样本后下注）：")
+    pe2 = PredictableBettingProcess(M, strat, ALPHA)
+    try:
+        pe2.observe(0.9)
+    except RuntimeError as exc:
+        print(f"  捕获 {type(exc).__name__}: {exc}")
+    print("E2 恢复时篡改策略 lambda，指纹不一致被拒绝：")
+    pe2.extend([0.9, 0.2, 1.0])
+    saved = pe2.to_json()
+    import json as _json
+    d2 = _json.loads(saved)
+    d2["strategy"]["bet_lambdas"]["high"] = 1.5
+    try:
+        PredictableBettingProcess.from_dict(d2)
+    except ValueError as exc:
+        print(f"  捕获 {type(exc).__name__}: {exc}")
 
     print("\n" + "=" * 72)
     print(f"演示完成，实际耗时 {time.perf_counter() - t0:.3f} 秒（无 sleep、无网络）。")
