@@ -9,6 +9,10 @@
 - 在 H0 下每个因子条件期望 ≤ 1，`W_λ` 与 `E_t` 均为非负上鞅；
   由 Ville 不等式 `P_H0(∃t: E_t ≥ 1/α) ≤ α`，故可在**任意可选停止时刻**下结论。
 - 任意时刻 p 值 `p_t = min(1, 1 / max_{s≤t} E_s)`。
+- 新增 `RestartEvidenceMixture`：在有限个候选起点 `s=1..S` 分别重启上述下注过程，
+  用事先给定、非负且总和为 1 的权重混合：
+  `M_t = Σ_{s≤min(t,S)} w_s E_s(t) + Σ_{s>min(t,S)} w_s`。
+  尚未到来的起点以财富 1 计入，不丢弃这部分质量，也不重新归一化早期分量。
 
 ## 运行环境与命令
 
@@ -16,11 +20,18 @@
 - **无需安装任何第三方依赖**，不需要网络、账号、密钥、数据库或 Docker。
 
 ```bash
-# 必要测试（独立 Fraction 参考 + 契约边界测试，共 42 个）
+# 可选：使用隔离 venv（只含标准库；无需 pip install）
+python3.14 -m venv .venv
+. .venv/bin/activate
+
+# 必要测试（基线回归 + 重启混合独立 Fraction 参考与契约测试）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（确定性数据，真实计算，实测约 0.04 秒，远小于 8 秒）
+# 基线固定输入演示（确定性数据，真实计算）
 python demo.py
+
+# 重启混合逐样本离线演示（实测毫秒级，硬性预算 < 90 秒）
+python demo_iteration.py
 ```
 
 ## 公开接口
@@ -39,6 +50,39 @@ proc2 = MeanEvidenceProcess.from_json(
     text, m=0.5, lambdas=[0.0, 0.5, 1.0, 2.0], alpha=0.05
 )                                # 恢复；m/lambdas/alpha 为配置断言
 ```
+
+重启混合入口：
+
+```python
+from mean_evidence import RestartEvidenceMixture
+
+detector = RestartEvidenceMixture(
+    m=0.5,
+    lambdas=[0.0, 2.0],
+    alpha=0.05,
+    start_weights=[0.25, 0.25, 0.25, 0.25],
+    max_starts=4,
+)
+snap = detector.update(1)
+snap = detector.extend([0, 1])
+print(snap.evidence, snap.stop_time, snap.start_contributions, snap.future_weight)
+component = detector.component_snapshot(start=1)
+```
+
+`RestartEvidenceSnapshot` 字段包括：
+
+| 字段 | 含义 |
+|---|---|
+| `evidence` / `log_evidence` | 当前固定权重混合 e 值；含未开启起点保留质量 |
+| `max_evidence` / `p_value` | 运行期峰值及 anytime p 值 |
+| `stop_time` | 混合 e 值首次越过 `1/alpha` 的时刻；越界后只冻结记录 |
+| `start_contributions` | 固定长度 `max_starts` 的各起点当前贡献 `w_s E_s(t)`，未开启为 0 |
+| `log_start_contributions` | 各贡献的 log；零权重、未开启或分量全死亡时为 `-inf` |
+| `future_weight` | 尚未开启候选起点的权重总和；这些权重以财富 1 参与混合 |
+
+检测器逐样本开启当前分量并更新此前所有已开启分量。零权重分量仍按原规则推进，
+可通过 `component_snapshot` 观察，但对混合值贡献为 0。报警后继续输入时，
+`stop_time` 保持首次时刻，所有分量与权重仍按原规则更新，不依据数据改权重。
 
 `EvidenceSnapshot`（frozen dataclass）字段：
 
@@ -67,6 +111,10 @@ proc2 = MeanEvidenceProcess.from_json(
   未设网格长度上限——它是 O(网格数 × 观测数) 的计算预算边界而非协议限制；
   演示与测试只使用小规模。
 - `alpha`：严格 `0 < alpha < 1` 的有限实数。
+- `start_weights`：非空有限实数序列，每项有限且非负，使用 `math.fsum`
+  校验总和必须恰为 `1.0`；长度必须等于有限正整数 `max_starts`。
+- `max_starts`：有限正整数；显式拒绝 `bool`。超过该数量后不再开启新起点，
+  此前权重已全部固定在混合中，`future_weight=0`。
 - 观测 `x_t`：有限且 `0 ≤ x_t ≤ 1`，`int` 或 `float`（接受 `0`、`1` 整数边界）。
 
 **错误类型约定**
@@ -130,6 +178,10 @@ proc2 = MeanEvidenceProcess.from_json(
 ## 已知限制 / 范围声明
 
 - 证据**只针对条件均值上界 H0：`E[x_t | F_{t-1}] ≤ m`**。
+  重启混合把 H0 理解为所有候选起点之前均满足该条件均值上界；每个起点的分量是
+  从该点重新开始的同一零假设下注证据。权重是先验分布，不随观测重分配。
+  即使某一起点分量当前贡献最大，也**不能把该起点宣称为已认证变点估计**；
+  它只描述混合中各部分的当前证据贡献。
   该保证允许观测自适应、可非同分布，**不要求独立性**；相应地，模块不对独立性、
   分布形态、方差、分位数或相关性作任何额外断言，λ 网格选择影响功效但不影响第一类错误控制。
 - 要求 `x_t ∈ [0,1]` 与 `0 ≤ λ ≤ 1/m`，这是因子非负（Ville 适用）的前提；
@@ -144,7 +196,10 @@ proc2 = MeanEvidenceProcess.from_json(
 - `mean_evidence.py` — 核心模块（无第三方依赖）。
 - `tests/test_independent_reference.py` — 独立 Fraction 参考：两点 Bernoulli 全路径枚举
   验证 H0 下 `E[W_λ] ≤ 1`、Ville 命中质量 ≤ α，以及与核心的逐点对照。
+- `tests/test_restart_mixture.py` — 对每个后缀从头重算的独立 Fraction 参考，
+  覆盖无变化、晚变化、零权重、未开启质量保留、越界后继续与原子性。
 - `tests/test_contract.py` — 0/1 边界、零因子、非法 λ、NaN/bool 拒绝、
   批量原子性、状态恢复/损坏/配置锁定、长流不溢出等契约测试。
 - `demo.py` — 固定确定性输入：正常停止、正常不拒绝、三类实际触发的异常边界、
   序列化恢复一致性。
+- `demo_iteration.py` — 重启混合逐样本离线演示：无变化、晚变化、零权重和报警后继续。
