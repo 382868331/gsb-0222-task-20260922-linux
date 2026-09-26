@@ -13,6 +13,10 @@
 本模块全程在 log 域累计，财富归零（因子恰为 0）后该轨道永久为 0；
 支持逐点/批量追加与 JSON 序列化，恢复时 m 与 λ 网格不可更改。
 
+另提供固定非负权重的多起点混合入口：每个可能起点重新运行同一财富过程，
+尚未开启的分量以初始财富 1 保留其先验质量；该入口只给条件均值零假设的证据，
+不把贡献最大的起点解释为已认证变点。
+
 只依赖 Python 3.14 标准库。
 """
 
@@ -24,8 +28,10 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 
 __all__ = [
+    "ChangePointEvidenceProcess",
     "EvidenceSnapshot",
     "MeanEvidenceProcess",
+    "MixedEvidenceSnapshot",
     "STATE_VERSION",
 ]
 
@@ -115,6 +121,29 @@ class EvidenceSnapshot:
     threshold: float
     stopped: bool
     stop_time: Optional[int]
+
+
+@dataclass(frozen=True)
+class MixedEvidenceSnapshot:
+    """固定起点权重混合后的证据快照。
+
+    component_evidence : 第 s 个可能起点重新开始后的 E_t；尚未开启时为 1。
+    contributions      : 各起点对混合值的实际加项 w_s E_s；未来起点为 w_s。
+    active_starts      : 当前已经开启的分量数。
+    """
+
+    t: int
+    evidence: float
+    log_evidence: float
+    max_evidence: float
+    max_log_evidence: float
+    p_value: float
+    threshold: float
+    stopped: bool
+    stop_time: Optional[int]
+    active_starts: int
+    component_evidence: tuple[float, ...]
+    contributions: tuple[float, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -409,3 +438,205 @@ class MeanEvidenceProcess:
         for x in validated:
             self._advance_one(x)
         return self.snapshot()
+
+
+class ChangePointEvidenceProcess:
+    """按固定权重混合多个可能重启起点的均值证据过程。
+
+    可能起点用零基下标 ``s=0,...,max_starts-1`` 表示：第 ``s`` 个分量从第
+    ``s+1`` 个观测开始重新运行原有 :class:`MeanEvidenceProcess`。在它开启前，
+    该分量的财富恒为初始值 1，因此当前混合值始终包含 ``w_s`` 这部分质量；
+    不能在早期只按已开启权重重归一化。
+
+    权重在构造时固定且总和必须为 1。越过阈值只记录首次报警时刻，之后仍继续
+    更新所有已开启分量，并按原计划开启新分量，不依据数据重分配权重。
+    """
+
+    def __init__(self, m, lambdas: Sequence, alpha, weights: Sequence, max_starts: int):
+        m_f, grid, a_f = _validate_config(m, lambdas, alpha)
+        weights_tuple = _validate_weights(weights)
+        if isinstance(max_starts, bool) or not isinstance(max_starts, int):
+            raise TypeError(
+                "max_starts: 需要正 int，实际得到 "
+                f"{type(max_starts).__name__}"
+            )
+        if max_starts <= 0:
+            raise ValueError(f"max_starts: 必须为正整数，得到 {max_starts!r}")
+        if len(weights_tuple) != max_starts:
+            raise ValueError(
+                f"weights: 长度必须等于 max_starts={max_starts}，"
+                f"得到 {len(weights_tuple)}"
+            )
+
+        self._m = m_f
+        self._lambdas = grid
+        self._alpha = a_f
+        self._threshold = 1.0 / a_f
+        self._log_threshold = math.log(self._threshold)
+        self._weights = weights_tuple
+        self._max_starts = max_starts
+        self._components: list[MeanEvidenceProcess] = [
+            MeanEvidenceProcess(m_f, grid, a_f)
+        ]
+        self._t = 0
+        self._max_log_e = 0.0
+        self._stop_time: Optional[int] = None
+
+    @property
+    def m(self) -> float:
+        return self._m
+
+    @property
+    def lambdas(self) -> tuple[float, ...]:
+        return self._lambdas
+
+    @property
+    def alpha(self) -> float:
+        return self._alpha
+
+    @property
+    def weights(self) -> tuple[float, ...]:
+        return self._weights
+
+    @property
+    def max_starts(self) -> int:
+        return self._max_starts
+
+    @property
+    def t(self) -> int:
+        return self._t
+
+    @property
+    def active_starts(self) -> int:
+        return len(self._components)
+
+    def component_log_evidence(self) -> tuple[float, ...]:
+        """返回所有起点当前 log E；尚未开启的起点为 log(1)=0。"""
+        values = [0.0] * self._max_starts
+        for i, proc in enumerate(self._components):
+            values[i] = proc.snapshot().log_evidence
+        return tuple(values)
+
+    def component_evidence(self) -> tuple[float, ...]:
+        """返回所有起点当前 E；尚未开启的起点为初始值 1。"""
+        values = [1.0] * self._max_starts
+        for i, proc in enumerate(self._components):
+            values[i] = proc.snapshot().evidence
+        return tuple(values)
+
+    def contributions(self) -> tuple[float, ...]:
+        """返回各起点对当前混合值的加项 ``w_s * E_s``。"""
+        evidence = self.component_evidence()
+        return tuple(
+            0.0 if weight == 0.0 else weight * value
+            for weight, value in zip(self._weights, evidence)
+        )
+
+    def _mixed_log_evidence(self) -> float:
+        terms: list[float] = []
+        for s, proc in enumerate(self._components):
+            weight = self._weights[s]
+            log_e = proc.snapshot().log_evidence
+            if weight > 0.0 and log_e != -math.inf:
+                terms.append(math.log(weight) + log_e)
+        for s in range(len(self._components), self._max_starts):
+            weight = self._weights[s]
+            if weight > 0.0:
+                terms.append(math.log(weight))
+        if not terms:
+            return -math.inf
+        hi = max(terms)
+        total = math.fsum(math.exp(value - hi) for value in terms)
+        return hi + math.log(total)
+
+    def snapshot(self) -> MixedEvidenceSnapshot:
+        log_e = self._mixed_log_evidence()
+        if log_e == -math.inf:
+            evidence = 0.0
+        else:
+            try:
+                evidence = math.exp(log_e)
+            except OverflowError:
+                evidence = math.inf
+        try:
+            max_evidence = math.exp(self._max_log_e)
+        except OverflowError:
+            max_evidence = math.inf
+        return MixedEvidenceSnapshot(
+            t=self._t,
+            evidence=evidence,
+            log_evidence=log_e,
+            max_evidence=max_evidence,
+            max_log_evidence=self._max_log_e,
+            p_value=min(1.0, math.exp(-self._max_log_e)),
+            threshold=self._threshold,
+            stopped=self._stop_time is not None,
+            stop_time=self._stop_time,
+            active_starts=len(self._components),
+            component_evidence=self.component_evidence(),
+            contributions=self.contributions(),
+        )
+
+    def _validate_x(self, x) -> float:
+        f = _finite_real("x", x)
+        if not 0.0 <= f <= 1.0:
+            raise ValueError(f"x: 必须位于 [0,1]，得到 {f!r}")
+        return f
+
+    def _advance_one(self, x: float) -> None:
+        if self._t > 0 and len(self._components) < self._max_starts:
+            self._components.append(
+                MeanEvidenceProcess(self._m, self._lambdas, self._alpha)
+            )
+        for proc in self._components:
+            proc.update(x)
+        self._t += 1
+        log_e = self._mixed_log_evidence()
+        if log_e > self._max_log_e:
+            self._max_log_e = log_e
+        if self._stop_time is None and log_e >= self._log_threshold:
+            self._stop_time = self._t
+
+    def update(self, x) -> MixedEvidenceSnapshot:
+        """追加一个观测；先更新旧分量，再开启以当前样本为起点的新分量。"""
+        x_f = self._validate_x(x)
+        self._advance_one(x_f)
+        return self.snapshot()
+
+    def extend(self, xs) -> MixedEvidenceSnapshot:
+        """批量追加；先校验全部输入，失败时状态不变。"""
+        if isinstance(xs, (str, bytes)):
+            raise TypeError(f"xs: 需要可迭代的实数序列，实际得到 {type(xs).__name__}")
+        validated: list[float] = []
+        try:
+            iterator = iter(xs)
+        except TypeError as exc:
+            raise TypeError(f"xs: 不可迭代: {type(xs).__name__}") from exc
+        for i, x in enumerate(iterator):
+            f = _finite_real(f"xs[{i}]", x)
+            if not 0.0 <= f <= 1.0:
+                raise ValueError(f"xs[{i}]: 必须位于 [0,1]，得到 {f!r}")
+            validated.append(f)
+        for x in validated:
+            self._advance_one(x)
+        return self.snapshot()
+
+
+def _validate_weights(weights: Sequence) -> tuple[float, ...]:
+    if isinstance(weights, (str, bytes)) or not isinstance(weights, Sequence):
+        raise TypeError(
+            "weights: 需要有限非负实数序列，实际得到 "
+            f"{type(weights).__name__}"
+        )
+    if not weights:
+        raise ValueError("weights: 不能为空")
+    out: list[float] = []
+    for i, weight in enumerate(weights):
+        f = _finite_real(f"weights[{i}]", weight)
+        if f < 0.0:
+            raise ValueError(f"weights[{i}]: 必须非负，得到 {f!r}")
+        out.append(f)
+    total = math.fsum(out)
+    if total != 1.0:
+        raise ValueError(f"weights: 总和必须固定为 1，得到 {total!r}")
+    return tuple(out)

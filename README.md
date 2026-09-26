@@ -16,11 +16,18 @@
 - **无需安装任何第三方依赖**，不需要网络、账号、密钥、数据库或 Docker。
 
 ```bash
-# 必要测试（独立 Fraction 参考 + 契约边界测试，共 42 个）
+# 可选：使用隔离 venv；本项目不安装第三方包，也不需要 pip install -r
+python3.14 -m venv .venv
+source .venv/bin/activate
+
+# 必要测试（基线回归 + 固定起点权重混合，共 51 个）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（确定性数据，真实计算，实测约 0.04 秒，远小于 8 秒）
 python demo.py
+
+# 本次新增：逐样本混合多个可能重启起点的离线演示（远小于 90 秒）
+python demo_iteration.py
 ```
 
 ## 公开接口
@@ -57,6 +64,47 @@ proc2 = MeanEvidenceProcess.from_json(
 
 越界只记录 `stop_time`，**不禁止继续追加**；`stop_time` 永远是首次时刻。
 
+### 固定起点权重混合入口
+
+`ChangePointEvidenceProcess` 在原有下注财富过程之外增加一层**事先固定**的起点混合。
+设最多考虑 `S` 个可能起点，权重 `w_s ≥ 0` 且 `Σw_s=1`；第 `s` 个分量从第 `s+1`
+个观测开始重新运行一个原始 `MeanEvidenceProcess`。尚未开启时该分量初始证据为 1，
+当前混合值为：
+
+```text
+M_t = Σ_s w_s E_t^(s)，其中未开启起点的 E_t^(s)=1
+```
+
+因此未来起点在早期保留 `w_s` 质量，不能把早期证据除以“已开启权重之和”人为放大。
+在给定 H0 下，每个未开启项恒为 1，每个已开启项是非负上鞅，加权和仍为非负上鞅；
+对 `M_t ≥ 1/α` 同样适用 Ville 界。权重和分量开启计划在构造时固定，看到数据后不重分配。
+
+```python
+from mean_evidence import ChangePointEvidenceProcess
+
+proc = ChangePointEvidenceProcess(
+     m=0.5,
+     lambdas=[0.0, 2.0],
+     alpha=0.2,
+     weights=[0.0, 0.0, 0.0, 0.5, 0.5],
+     max_starts=5,
+)
+snap = proc.update(x)   # 逐样本更新所有已开启分量，并开启当前允许的新起点
+```
+
+`MixedEvidenceSnapshot` 在常规证据字段外增加：
+
+| 字段 | 含义 |
+|---|---|
+| `active_starts` | 当时已经开启的分量数 |
+| `component_evidence` | 每个可能起点的 `E_t^(s)`；未开启为 `1.0` |
+| `contributions` | 每个起点对混合值的实际加项 `w_s E_t^(s)`；未开启为 `w_s` |
+
+`max_starts` 是有限正整数；当样本数超过它后，不再开启更晚起点，但所有已开启分量仍继续
+按原规则处理后续观测。首次越界只冻结 `stop_time`，后续数值、峰值和分量贡献继续更新。
+该输出是对给定零假设的证据，`argmax_s w_s E_t^(s)` 只是当前贡献来源，**不是已认证的
+变点估计**，也不提供变点后验概率或置信区间。
+
 ## 输入上限与错误语义
 
 **接口边界（构造参数）**
@@ -68,6 +116,8 @@ proc2 = MeanEvidenceProcess.from_json(
   演示与测试只使用小规模。
 - `alpha`：严格 `0 < alpha < 1` 的有限实数。
 - 观测 `x_t`：有限且 `0 ≤ x_t ≤ 1`，`int` 或 `float`（接受 `0`、`1` 整数边界）。
+- 混合入口的 `weights`：非空有限非负实数序列，长度必须等于 `max_starts`；
+  使用 `math.fsum` 校验总和恰为 `1.0`，允许零权重；`max_starts` 必须为正整数。
 
 **错误类型约定**
 
@@ -125,7 +175,8 @@ proc2 = MeanEvidenceProcess.from_json(
 4. **停止是只读事件**：越过阈值后过程仍可追加，便于越过之后继续观察 p 值；
    Ville 界约束的是首次越界概率。
 5. **状态只存 log 财富与峰值**：恢复后从财富重算当前 `log E` 并交叉校验峰值，
-   不盲信序列化的派生量。
+  不盲信序列化的派生量。
+6. **起点权重先验固定、未来质量保留为 1**：这保证加权和在上鞅框架内；不做数据驱动选起点。
 
 ## 已知限制 / 范围声明
 
@@ -136,12 +187,17 @@ proc2 = MeanEvidenceProcess.from_json(
   无界观测或其他参数化（如 e-process 的其他混合测度）不在本题契约内。
 - 不实现流式网格扩展、连续 λ 积分、多重检验校正，也不宣称兼容任何行业标准协议；
   这只是本题规定的有限数学子集。
+- 混合入口只检验同一个条件均值上界 H0；它不估计变点位置、不检验“何时发生变化”、
+  不给最大贡献起点赋予认证语义，也不自动扩展到方差、分位数或其他参数模型。
 - 线程安全：对象无内置锁；多线程使用请自行同步。
 - 状态 JSON 为人工可读格式，但仅支持 `version=1`，跨版本迁移未实现。
 
 ## 文件
 
 - `mean_evidence.py` — 核心模块（无第三方依赖）。
+- `demo_iteration.py` — 固定权重、有限最大起点数的逐样本离线混合演示。
+- `tests/test_change_point_mixture.py` — 每个短后缀独立从头重算的 Fraction 参考，
+  覆盖无变化、晚变化、零权重、未来起点质量、最大起点数及报警后继续输入。
 - `tests/test_independent_reference.py` — 独立 Fraction 参考：两点 Bernoulli 全路径枚举
   验证 H0 下 `E[W_λ] ≤ 1`、Ville 命中质量 ≤ α，以及与核心的逐点对照。
 - `tests/test_contract.py` — 0/1 边界、零因子、非法 λ、NaN/bool 拒绝、
